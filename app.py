@@ -69,7 +69,7 @@ def _validate_upload(part_name: str, expected_exts=None):
     if part_name not in request.files:
         return _json_error("No file part")
     file = request.files[part_name]
-    if file.filename == "":
+    if not file.filename or file.filename == "":
         return _json_error("Empty filename")
     if expected_exts:
         fname_lower = file.filename.lower()
