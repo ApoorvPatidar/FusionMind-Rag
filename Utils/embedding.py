@@ -6,8 +6,8 @@ os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.schema import Document
-from langchain.embeddings.base import Embeddings
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from typing import List, Optional
 from Utils.logger import logging
 

@@ -1,11 +1,12 @@
 """RAG (Retrieval-Augmented Generation) using LangChain chains."""
 
-from langchain.chains import RetrievalQA
+from langchain_classic.chains import RetrievalQA
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
+from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
 from typing import List, Optional
 from Utils.logger import logging
+from Utils.telemetry import TELEMETRY, RetrievalRecord
 import os
 import re
 
@@ -128,6 +129,28 @@ class RAG:
                     sources_text += f"{i}. {prefix}: {snippet}\n"
                 answer += sources_text
             
+            # Fire-and-forget telemetry: never let logging errors surface to the caller.
+            try:
+                used_mmr = getattr(
+                    getattr(self.retriever, "search_type", None), "__str__", lambda: ""
+                )() == "mmr" or getattr(self.retriever, "search_type", "") == "mmr"
+                TELEMETRY.log(RetrievalRecord(
+                    query=question,
+                    retrieved_chunk_sources=[
+                        os.path.basename(str(d.metadata.get("source", ""))) for d in source_docs
+                    ],
+                    retrieved_chunk_lengths=[len(d.page_content or "") for d in source_docs],
+                    avg_chunk_length=(
+                        sum(len(d.page_content or "") for d in source_docs) / len(source_docs)
+                        if source_docs else 0.0
+                    ),
+                    answer_length=len(answer),
+                    used_web_augmentation=False,
+                    used_mmr=used_mmr,
+                ))
+            except Exception as _tel_err:
+                logging.warning(f"telemetry log failed in answer() (non-fatal): {_tel_err}")
+
             return answer
         except Exception as e:
             logging.exception("RAG answer generation failed")
@@ -159,12 +182,38 @@ class RAG:
         try:
             pdf_docs: List[Document] = []
             try:
-                pdf_docs = self.retriever.retriever.get_relevant_documents(question)  # type: ignore
+                pdf_docs = self.retriever.retriever.invoke(question)  # type: ignore
             except Exception:
                 pdf_docs = []
 
+            # DESIGN NOTE: URL-domain deduplication before merging.
+            # When a PDF is attached the user may have uploaded a paper or report
+            # that is also indexed on the web.  Without deduplication,
+            # answer_augmented() can fill the context window with near-duplicate
+            # content from the PDF chunks AND a web snippet of the same document,
+            # wasting tokens and confusing the LLM's citation logic.
+            # Strategy: collect base-names of PDF source paths, then drop any
+            # web doc whose URL or title contains that base-name as a substring.
+            pdf_source_hints: set = set()
+            for d in pdf_docs:
+                src = str(d.metadata.get("source", ""))
+                if src:
+                    pdf_source_hints.add(os.path.basename(src).lower().replace(".pdf", ""))
+
+            def _is_duplicate_web_doc(doc: Document) -> bool:
+                if not pdf_source_hints:
+                    return False
+                url = str(doc.metadata.get("url", "") or doc.metadata.get("source", "")).lower()
+                title = str(doc.metadata.get("title", "")).lower()
+                return any(hint and (hint in url or hint in title) for hint in pdf_source_hints)
+
+            deduped_extra = [d for d in (extra_docs or []) if not _is_duplicate_web_doc(d)]
+            removed = len(extra_docs or []) - len(deduped_extra)
+            if removed:
+                logging.info(f"deduped {removed} web doc(s) overlapping with PDF source")
+
             # Merge and truncate to a manageable number for context stuffing
-            all_docs = (pdf_docs[:5] if pdf_docs else []) + (extra_docs[:5] if extra_docs else [])
+            all_docs = (pdf_docs[:5] if pdf_docs else []) + (deduped_extra[:5] if deduped_extra else [])
             if not all_docs:
                 # No docs available; just defer to standard answer
                 return self.answer(question)
@@ -195,6 +244,29 @@ class RAG:
                 sources.append(mk_source(d))
             if sources:
                 answer += "\n\n---\nSources:\n" + "\n".join(f"- {s}" for s in sources[:cite_limit * 2])
+
+            # Fire-and-forget telemetry for augmented answers.
+            try:
+                all_retrieved = pdf_docs + deduped_extra
+                used_mmr = getattr(self.retriever, "search_type", "") == "mmr"
+                TELEMETRY.log(RetrievalRecord(
+                    query=question,
+                    retrieved_chunk_sources=[
+                        os.path.basename(str(d.metadata.get("source", "") or d.metadata.get("url", ""))) 
+                        for d in all_retrieved
+                    ],
+                    retrieved_chunk_lengths=[len(d.page_content or "") for d in all_retrieved],
+                    avg_chunk_length=(
+                        sum(len(d.page_content or "") for d in all_retrieved) / len(all_retrieved)
+                        if all_retrieved else 0.0
+                    ),
+                    answer_length=len(answer),
+                    used_web_augmentation=bool(deduped_extra),
+                    used_mmr=used_mmr,
+                ))
+            except Exception as _tel_err:
+                logging.warning(f"telemetry log failed in answer_augmented() (non-fatal): {_tel_err}")
+
             return answer
         except Exception as e:
             logging.exception("augmented answer failed")

@@ -1,7 +1,7 @@
 """FAISS vector store using LangChain integration for fast similarity search."""
 
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Document
+from langchain_core.documents import Document
 from typing import List, Optional
 from Utils.logger import logging
 

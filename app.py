@@ -11,24 +11,65 @@ from io import BytesIO
 from flask import Flask, render_template, request, jsonify, session as flask_session
 from dotenv import load_dotenv
 
+from Utils.ttl_cache import TTLDict
 from Utils.pdf_utils import load_pdf, clean_documents
-from Utils.chunking import chunk_documents
+from Utils.chunking import chunk_documents, select_chunk_size
 from Utils.embedding import EmbedData
 from Utils.vector_db import FAISSVectorStore
 from Utils.retriever import Retriever
 from Utils.rag import RAG
 from Utils.image_embedding import ImageEmbedder
-from Utils.web_search import search_to_documents
+from Utils.web_search import search_to_documents, build_augmented_query, _QUESTION_WORDS
+from Utils.telemetry import TELEMETRY
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from History.history import History
-from Utils.logger import logging
+from Utils.logger import logging, set_log_session_id, clear_log_session_id
 from PIL import Image
 
 
 load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
+
+# DESIGN NOTE: Module-level counter for amortized session eviction.
+# Using a mutable list avoids the 'global' keyword inside the closure and is
+# slightly easier to reason about in single-threaded Flask dev mode.
+# In multi-worker gunicorn each worker has its own counter — that's fine;
+# eviction is best-effort, not a strict invariant.
+_REQUEST_COUNTER = [0]
+
+
+@app.before_request
+def _periodic_session_evict() -> None:
+    """Evict idle sessions every 100 requests to bound SESSIONS memory.
+
+    # DESIGN NOTE: Calling evict() on every request would add O(n) overhead to
+    # every hot path. Calling it every 100th request amortizes that cost while
+    # still bounding worst-case stale-entry lifetime to
+    # ~(100 * avg_request_interval + TTL).  For a lightly-loaded server the
+    # interval is generous; for a heavily-loaded one it fires frequently enough
+    # to keep memory in check.
+    """
+    _REQUEST_COUNTER[0] += 1
+    if _REQUEST_COUNTER[0] % 100 == 0:
+        removed = SESSIONS.evict(max_age_seconds=7200)
+        if removed:
+            logging.info(f"session eviction removed={removed} total_remaining={len(SESSIONS)}")
+
+
+# DESIGN NOTE: Thread-local session_id injection.
+# Flask's default WSGI mode (Werkzeug threaded=True) assigns one OS thread per
+# concurrent request.  threading.local() therefore gives each request its own
+# isolated slot — there is no cross-request data bleed.  This guarantee breaks
+# under async workers (Quart, async Flask) or green-thread pools (gevent,
+# eventlet) where many coroutines share one OS thread.  If you ever switch to
+# those concurrency models, replace threading.local() with a contextvars.ContextVar.
+@app.before_request
+def _inject_log_session_id() -> None:
+    """Stamp every log line in this request with the caller's session_id."""
+    sid = flask_session.get("sid", "-")
+    set_log_session_id(sid)
 
 
 """In-memory user session mapping.
@@ -41,7 +82,12 @@ Structure:
 SESSIONS[sid] = { "chat_ids": [history_session_ids...], "active_chat_id": str }
 """
 
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+# DESIGN NOTE: TTLDict replaces the plain dict to prevent unbounded memory
+# growth. Every browser tab / visitor that stops using the app keeps its
+# ChatMessageHistory alive in memory forever with a raw dict. TTLDict evicts
+# sessions idle for >2 h, which matches a typical "browser closed" scenario.
+# History sessions are cleaned up via HISTORY.delete_session() inside evict_history_sessions().
+SESSIONS: TTLDict = TTLDict()
 HISTORY = History()
 NORMAL_CHAT_LLM: ChatGoogleGenerativeAI | None = None
 IMAGE_EMBEDDER: ImageEmbedder | None = None
@@ -84,7 +130,17 @@ def _summarize(text: str, max_len: int = 50) -> str:
 
 def get_session_id() -> str:
     sid = flask_session.get("sid")
+    # DESIGN NOTE: Guard against two failure modes:
+    #   1. sid is absent (new visitor or cookie cleared).
+    #   2. sid exists in the cookie but is missing from SESSIONS — this happens
+    #      when the Flask secret key rotates (cookie invalid), the server
+    #      restarts (SESSIONS wiped), or TTLDict evicted an idle session.
+    # Treating both cases identically (create fresh) prevents a KeyError from
+    # propagating and silently orphans the stale cookie, which is the correct
+    # UX: the user simply starts a new session.
     if not sid or sid not in SESSIONS:
+        if sid and sid not in SESSIONS:
+            logging.info(f"session expired or missing, creating new (old sid={sid})")
         sid = str(uuid.uuid4())
         flask_session["sid"] = sid
         # create first History session
@@ -240,9 +296,21 @@ def build_rag_pipeline_from_pdf(file_storage) -> RAG:
         documents = clean_documents(documents)
         total_chars = sum(len(d.page_content or "") for d in documents)
         logging.info(f"pdf text total_chars={total_chars}")
-        
+
         # 2. Chunk documents with overlap
-        chunks = chunk_documents(documents, chunk_size=1500, chunk_overlap=250)
+        # DESIGN NOTE: chunk_size and chunk_overlap are derived from total_chars
+        # rather than hardcoded.  A single fixed size performs poorly at the
+        # extremes: tiny docs end up with 2-3 gigantic chunks (MMR has nothing
+        # to compare), while book-length docs produce thousands of micro-fragments
+        # that overflow the retriever's fetch_k budget.  select_chunk_size()
+        # maps document scale to a (size, overlap) pair that keeps the chunk
+        # count in the practical range of 20-200 for any input.
+        chunk_size, chunk_overlap = select_chunk_size(total_chars)
+        logging.info(
+            f"adaptive chunking total_chars={total_chars} "
+            f"chunk_size={chunk_size} overlap={chunk_overlap}"
+        )
+        chunks = chunk_documents(documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         # Chunk stats
         clens = [len(c.page_content or "") for c in chunks]
         if clens:
@@ -250,7 +318,16 @@ def build_rag_pipeline_from_pdf(file_storage) -> RAG:
                 f"chunked into {len(chunks)} chunks len_min={min(clens)} len_p50={sorted(clens)[len(clens)//2]} len_max={max(clens)}"
             )
         else:
-            logging.warning("no chunks produced from PDF")
+            # DESIGN NOTE: Raise immediately rather than continue building an
+            # empty FAISS index.  An empty index causes FAISS to return 0 docs
+            # on every query, the LLM receives no context, and the answer is
+            # silently fabricated.  A ValueError here is caught by the
+            # api_upload_pdf() route which returns an HTTP 400 with a message
+            # the UI can display directly to the user.
+            raise ValueError(
+                "PDF appears to be image-only or unreadable. "
+                "Please upload a text-based PDF."
+            )
         
         # 3. Initialize embedding model (toggle via USE_GOOGLE_EMBEDDINGS)
         use_google = os.getenv("USE_GOOGLE_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes"}
@@ -261,12 +338,40 @@ def build_rag_pipeline_from_pdf(file_storage) -> RAG:
         vector_store = FAISSVectorStore(embed_model.embedding_model)
         vector_store.create_from_documents(chunks)
         logging.info(f"created FAISS index")
-        
+
+        # Read MMR config from environment so values can be tuned without
+        # touching source code (e.g., per-deployment .env overrides).
+        mmr_k = int(os.getenv("MMR_K", "6"))
+        mmr_fetch_k = int(os.getenv("MMR_FETCH_K", "20"))
+        mmr_lambda = float(os.getenv("MMR_LAMBDA", "0.7"))
+
+        # Guard: FAISS MMR silently degrades to similarity search when
+        # fetch_k > index size.  Clamp fetch_k to the actual vector count so
+        # the configured k/fetch_k ratio is preserved and the log is honest.
+        try:
+            ntotal = vector_store.vector_store.index.ntotal
+            if ntotal < mmr_fetch_k:
+                logging.warning(
+                    f"fetch_k reduced to {ntotal} because index has fewer "
+                    f"vectors than fetch_k (requested fetch_k={mmr_fetch_k})"
+                )
+                mmr_fetch_k = ntotal
+        except AttributeError:
+            pass  # index not yet built or non-FAISS backend; skip guard
+
+        # DESIGN NOTE: lambda_mult=0.7 (70 % relevance / 30 % diversity).
+        # The original 0.5 gave equal weight to diversity and relevance, which
+        # is appropriate for large corpora where duplicate chunks are common.
+        # For focused document QA — especially short PDFs — there are not enough
+        # chunks for diversity to add value, and throwing away half the relevance
+        # signal degrades answer accuracy.  0.7 is the standard recommendation
+        # in the LangChain MMR docs for document QA workloads.  The value is
+        # still env-configurable (MMR_LAMBDA) for experimentation.
         # 5. Create retriever (use MMR to improve diversity/recall)
         retriever = Retriever(
             vector_store=vector_store,
             search_type="mmr",
-            search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.5},
+            search_kwargs={"k": mmr_k, "fetch_k": mmr_fetch_k, "lambda_mult": mmr_lambda},
         )
         
         # 6. Build RAG chain
@@ -312,12 +417,28 @@ def api_chat():
     labels = HISTORY.get_image_labels(chat_id)
     web_docs = []
     try:
-        if labels:
-            # Use a focused query combining user message and top labels
-            q = message
-            if labels:
-                q = f"{message} {' '.join(labels[:3])}"
+        # DESIGN NOTE: Web search should only fire when it can plausibly improve
+        # the answer.  Two heuristics gate the call:
+        #   1. The user message contains question-intent words AND image labels
+        #      exist -- labels may help disambiguate the topic (e.g. "laptop"
+        #      steers a tech question toward the right domain).
+        #   2. The user explicitly references the image ("in this image",
+        #      "what do you see", "describe", "what is shown") -- we should
+        #      always search to enrich visual context in that case.
+        # Firing on every message when an image is present (the old behaviour)
+        # adds latency and injects irrelevant snippets into every answer.
+        msg_lower = message.lower()
+        has_question_intent = any(w in msg_lower.split() for w in _QUESTION_WORDS)
+        references_image = any(
+            phrase in msg_lower
+            for phrase in ("in this image", "what do you see", "describe the",
+                           "what is shown", "what's in", "whats in")
+        )
+        should_search = (labels and has_question_intent) or references_image
+        if should_search:
+            q = build_augmented_query(message, labels) if labels else message
             web_docs = search_to_documents(q, max_results=5)
+            logging.info(f"web search fired chat_id={chat_id} query='{q}'")
     except Exception:
         web_docs = []
 
@@ -488,6 +609,33 @@ def api_remove_image():
         return _json_error("Image not found", 404)
     logging.info(f"image removed chat_id={chat_id} name={name}")
     return jsonify({"status": "ok", "images": HISTORY.get_images(chat_id)})
+
+
+@app.route("/api/telemetry", methods=["GET"])
+def api_telemetry():
+    """Return retrieval quality summary statistics.
+
+    # DESIGN NOTE: This endpoint must NOT be publicly accessible.
+    # It exposes internal operational data (query counts, source filenames,
+    # augmentation rates) that could leak information about what documents
+    # users are uploading and querying.  We guard it with two mechanisms:
+    #   1. Localhost-only: requests from 127.0.0.1 / ::1 are always allowed
+    #      so the operator can inspect telemetry from the server shell.
+    #   2. Secret token: a TELEMETRY_SECRET env var enables remote access
+    #      for authorised monitoring dashboards without opening it to the
+    #      public internet.  Without either condition the route returns 403.
+    # In a production deployment you would place this behind an internal
+    # network / VPN rather than relying on a shared secret.
+    """
+    remote = request.remote_addr or ""
+    is_local = remote in ("127.0.0.1", "::1", "localhost")
+    secret = os.getenv("TELEMETRY_SECRET", "").strip()
+    provided = request.args.get("secret", "").strip()
+    is_authorised = is_local or (secret and provided == secret)
+    if not is_authorised:
+        logging.warning(f"telemetry access denied remote={remote}")
+        return jsonify({"error": "Forbidden"}), 403
+    return jsonify(TELEMETRY.summary())
 
 
 if __name__ == "__main__":
