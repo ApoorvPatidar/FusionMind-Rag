@@ -1,6 +1,6 @@
 """Text chunking using LangChain's RecursiveCharacterTextSplitter."""
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters.character import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from typing import List, Tuple
 from Utils.logger import logging

@@ -4,23 +4,31 @@ Includes text cleaning utilities to improve downstream chunking and embeddings
 quality (e.g., fix hyphenation, normalize whitespace, and common ligatures).
 """
 
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from typing import List
 from Utils.logger import logging
 import re
 import unicodedata
+from pypdf import PdfReader
 
 
 def load_pdf(pdf_path: str) -> List[Document]:
-    """Load PDF using LangChain's PyPDFLoader.
-    
+    """Load PDF using pypdf directly.
+
     Returns:
         List of Document objects with page_content and metadata (page number, source).
     """
     try:
-        loader = PyPDFLoader(pdf_path)
-        documents = loader.load()
+        reader = PdfReader(pdf_path)
+        documents = []
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text() or ""
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={"page": i, "source": pdf_path},
+                )
+            )
         logging.info(f"loaded pdf pages={len(documents)} path={pdf_path}")
         return documents
     except Exception as e:

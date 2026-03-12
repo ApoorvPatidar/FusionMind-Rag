@@ -5,7 +5,6 @@ import os
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from typing import List, Optional
@@ -76,13 +75,18 @@ class EmbedData:
                         model=self.model_name,
                         google_api_key=api_key
                     )
-                    fallback = HuggingFaceEmbeddings(
-                        model_name="sentence-transformers/all-MiniLM-L6-v2",
-                        model_kwargs={'device': 'cpu'},
-                        encode_kwargs={'normalize_embeddings': True}
-                    )
+                    fallback = None
+                    try:
+                        from langchain_huggingface import HuggingFaceEmbeddings
+                        fallback = HuggingFaceEmbeddings(
+                            model_name="sentence-transformers/all-MiniLM-L6-v2",
+                            model_kwargs={'device': 'cpu'},
+                            encode_kwargs={'normalize_embeddings': True}
+                        )
+                    except Exception as hf_err:
+                        logging.warning(f"HuggingFace fallback unavailable: {hf_err}")
                     self.embedding_model = SmartEmbeddings(primary=primary, fallback=fallback)
-                    logging.info(f"initialized Google embeddings model={self.model_name} with HF fallback")
+                    logging.info(f"initialized Google embeddings model={self.model_name}")
                     return
                 except Exception as e:
                     logging.warning(f"Google embeddings init failed: {e}, falling back to HuggingFace")
@@ -92,6 +96,7 @@ class EmbedData:
                 self.use_google = False
         
         # Fallback to HuggingFace
+        from langchain_huggingface import HuggingFaceEmbeddings
         self.embedding_model = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             model_kwargs={'device': 'cpu'},

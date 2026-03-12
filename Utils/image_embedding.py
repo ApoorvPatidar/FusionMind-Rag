@@ -9,7 +9,6 @@ from typing import List, Tuple
 from io import BytesIO
 
 from PIL import Image
-from sentence_transformers import SentenceTransformer
 import numpy as np
 
 # A compact vocabulary of common objects (COCO-80 classes)
@@ -30,6 +29,7 @@ class ImageEmbedder:
     """CLIP-based image embedder and zero-shot label predictor."""
 
     def __init__(self, model_name: str = "clip-ViT-B-32"):
+        from sentence_transformers import SentenceTransformer
         # This model supports encode_image and encode for PIL inputs
         self.model = SentenceTransformer(model_name)
         # Pre-encode vocabulary texts once for faster label prediction
